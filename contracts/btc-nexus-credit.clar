@@ -453,3 +453,133 @@
     })
   )
 )
+
+;; ADMIN FUNCTIONS
+
+;; Transfer admin rights
+(define-public (transfer-admin-rights (new_admin principal))
+  (begin  
+    (asserts! (verify-admin-access) ERR_UNAUTHORIZED_ACCESS)
+    (ok (var-set protocol_admin new_admin))
+  )
+)
+
+;; Set loan term
+(define-public (set-loan-term (days uint))
+  (begin
+    (asserts! (verify-admin-access) ERR_UNAUTHORIZED_ACCESS)
+    (asserts! (>= days u7) ERR_INSUFFICIENT_AMOUNT)
+    (ok (var-set loan_term_days days))
+  )
+)
+
+;; Set lock period
+(define-public (set-lock-period (days uint))
+  (begin
+    (asserts! (verify-admin-access) ERR_UNAUTHORIZED_ACCESS)
+    (asserts! (> days u0) ERR_INSUFFICIENT_AMOUNT)
+    (ok (var-set lender_lock_period days))
+  )
+)
+
+;; Set base interest rate
+(define-public (set-base-rate (rate_percent uint))
+  (begin
+    (asserts! (verify-admin-access) ERR_UNAUTHORIZED_ACCESS)
+    (asserts! (> rate_percent u0) ERR_INSUFFICIENT_AMOUNT)
+    (ok (var-set base_interest_rate rate_percent))
+  )
+)
+
+;; READ-ONLY FUNCTIONS
+
+;; Get loan eligibility status
+(define-read-only (get-loan-eligibility (account principal))
+  (let
+    (
+      (credit_record (default-to 
+        { 
+          total_loans: u0,
+          on_time_payments: u0,
+          late_payments: u0,
+        }
+        (map-get? credit_history account)
+      ))
+      (total_loans (get total_loans credit_record))
+      (on_time_payments (get on_time_payments credit_record))
+      (late_payments (get late_payments credit_record))
+      (rolling_balance (calculate-rolling-balance account))
+      (credit_limit (determine-credit-limit (+ (calculate-payment_score total_loans on_time_payments late_payments) (calculate-activity_score rolling_balance))))
+    )
+    (if (> total_loans (+ on_time_payments late_payments))
+      (ok {
+        status: "ACTIVE_LOAN_EXISTS",
+        available_credit: u0,
+        interest_rate: (var-get base_interest_rate),
+        loan_term: (var-get loan_term_days),
+      })
+      (if (>= credit_limit rolling_balance)
+        (ok {
+          status: "ELIGIBLE",
+          available_credit: rolling_balance,
+          interest_rate: (var-get base_interest_rate),
+          loan_term: (var-get loan_term_days),
+        })
+        (ok {
+          status: "ELIGIBLE",
+          available_credit: credit_limit,
+          interest_rate: (var-get base_interest_rate),
+          loan_term: (var-get loan_term_days),
+        })
+      )
+    )
+  )
+)
+
+;; Get protocol statistics
+(define-read-only (get-protocol-stats)
+  (ok {
+    lock_period_days: (var-get lender_lock_period),
+    total_pool_size: (var-get total_liquidity_pool),
+    available_liquidity: (unwrap-panic (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token get-balance (as-contract tx-sender)))
+  })
+)
+
+;; Get lender position details
+(define-read-only (get-lender-position)
+  (let
+    (
+      (position_balance (default-to u0 (get balance (map-get? lender_positions tx-sender))))
+      (available_liquidity (unwrap-panic (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token get-balance (as-contract tx-sender))))
+      (locked_block (default-to u0 (get locked_block (map-get? lender_positions tx-sender))))
+      (unlock_block (default-to u0 (get unlock_block (map-get? lender_positions tx-sender))))
+    )
+    (ok {
+      deposited_balance: position_balance,
+      current_value:  
+        (if (> position_balance u0)
+          (/ (* position_balance available_liquidity) (var-get total_liquidity_pool))
+          u0
+        ),
+      locked_until_block: unlock_block,
+      deposit_block: locked_block,
+      time_locked_seconds: (/ (- stacks-block-height locked_block) (seconds-per-block)),
+    })
+  )
+)
+
+;; Get borrower account summary
+(define-read-only (get-borrower-summary (account principal))
+  (ok {
+    active_loan_details: (map-get? active_loans account),
+    credit_history: (map-get? credit_history account),
+    total_repayment_due: (calculate-total-repayment account),
+  })
+)
+
+;; Get current block height
+(define-read-only (get-current-block)
+  (ok {
+    current_block_height: stacks-block-height,
+  })
+)
