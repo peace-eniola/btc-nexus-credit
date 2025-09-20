@@ -320,3 +320,136 @@
     (ok true)
   )
 )
+
+;; Get maximum withdrawal amount
+(define-read-only (get-max-withdrawal (lender principal))
+  (let
+    (
+      (lender_balance (default-to u0 (get balance (map-get? lender_positions lender))))
+      (contract_balance (unwrap-panic (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token get-balance (as-contract tx-sender))))
+      (max_withdrawal 
+        (if (> lender_balance u0)
+          (/ 
+            (* lender_balance contract_balance) 
+            (if (> (var-get total_liquidity_pool) u0)
+              (var-get total_liquidity_pool)
+              u1
+            )
+          )
+          u0
+        )
+      )
+    )
+    (asserts! (> lender_balance u0) ERR_INVALID_LENDER)
+    (ok {max_withdrawal_amount: max_withdrawal})
+  )
+)
+
+;; BORROWER FUNCTIONS
+
+;; Apply for credit with automated underwriting
+(define-public (apply-for-credit (requested_amount uint)) 
+  (let 
+    (
+      (credit_record (default-to {
+          total_loans: u0,
+          on_time_payments: u0,
+          late_payments: u0,
+        } (map-get? credit_history tx-sender)
+      ))
+      (loan_term_blocks (days-to-blocks (var-get loan_term_days)))
+    )
+    (asserts! (> requested_amount u0) ERR_INSUFFICIENT_AMOUNT)
+    (asserts! (assess-loan-eligibility tx-sender credit_record requested_amount) ERR_CREDIT_INELIGIBLE)
+    (asserts! (> (unwrap-panic (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token get-balance (as-contract tx-sender))) requested_amount) ERR_INSUFFICIENT_LIQUIDITY)
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token transfer requested_amount (as-contract tx-sender) tx-sender none))
+    (map-set active_loans tx-sender {
+      amount: requested_amount,
+      due_block: (+ stacks-block-height loan_term_blocks),
+      interest_rate: (var-get base_interest_rate),
+      issued_block: stacks-block-height
+    })
+    (map-set credit_history tx-sender {
+      total_loans: (+ u1 (get total_loans credit_record)),
+      on_time_payments: (get on_time_payments credit_record),
+      late_payments: (get late_payments credit_record),
+    })
+    (print 
+      {
+        event: "credit_approved", 
+        borrower: tx-sender, 
+        principal_amount: requested_amount,
+        total_repayment: (calculate-total-repayment tx-sender), 
+        due_block: (+ stacks-block-height loan_term_blocks), 
+        interest_rate: (var-get base_interest_rate), 
+        issued_block: stacks-block-height
+      })
+    (ok true)
+  )
+)
+
+;; Repay loan
+(define-public (repay-loan (borrower principal))
+  (let 
+    (
+      (loan_details (default-to { amount: u0, due_block: u0, interest_rate: u0, issued_block: u0, } (map-get? active_loans borrower)))
+      (total_repayment (calculate-total-repayment borrower))
+    )
+    (asserts! (> (get amount loan_details) u0) ERR_CREDIT_INELIGIBLE)
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token transfer total_repayment tx-sender (as-contract tx-sender) none))
+    (process-payment-and-update-history borrower)
+    (print {event: "loan_repaid", borrower: borrower, amount_paid: total_repayment})
+    (ok true)
+  )
+)
+
+;; Calculate total repayment amount
+(define-read-only (calculate-total-repayment (borrower principal))
+  (let 
+    (
+      (principal_amount (default-to u0 (get amount (map-get? active_loans borrower))))
+      (interest_rate (default-to u0 (get interest_rate (map-get? active_loans borrower))))
+    )
+    (if (> interest_rate u0)
+      (+ principal_amount (/ (* principal_amount interest_rate) u100))
+      u0
+    )
+  )
+)
+
+;; Get comprehensive credit assessment
+(define-read-only (get-credit-assessment (account principal))
+  (let
+    (
+      (credit_record (default-to {
+          total_loans: u0,
+          on_time_payments: u0,
+          late_payments: u0,
+        } (map-get? credit_history account)
+      ))
+      (total_loans (get total_loans credit_record))
+      (on_time_payments (get on_time_payments credit_record))
+      (late_payments (get late_payments credit_record))
+      (rolling_balance (calculate-rolling-balance account))
+      (credit_limit (determine-credit-limit (+ (calculate-payment_score total_loans on_time_payments late_payments) (calculate-activity_score rolling_balance))))
+    )
+    (asserts! (is-eq total_loans (+ late_payments on_time_payments)) (ok {
+      composite_score: (+ (calculate-payment_score total_loans on_time_payments late_payments) (calculate-activity_score rolling_balance)),
+      tier_limit: credit_limit,
+      rolling_balance: rolling_balance,
+      approved_limit: u0
+    }))
+    (asserts! (< rolling_balance credit_limit) (ok {
+      composite_score: (+ (calculate-payment_score total_loans on_time_payments late_payments) (calculate-activity_score rolling_balance)),
+      tier_limit: credit_limit,
+      rolling_balance: rolling_balance,
+      approved_limit: credit_limit
+    }))
+    (ok {
+      composite_score: (+ (calculate-payment_score total_loans on_time_payments late_payments) (calculate-activity_score rolling_balance)),
+      tier_limit: credit_limit,
+      rolling_balance: rolling_balance,
+      approved_limit: rolling_balance
+    })
+  )
+)
