@@ -175,3 +175,148 @@
     u0
   )
 )
+
+;; Comprehensive loan eligibility assessment
+(define-private 
+  (assess-loan-eligibility 
+    (applicant principal)
+    (credit_record  {
+      total_loans: uint,
+      on_time_payments: uint,
+      late_payments: uint,
+    })
+    (requested_amount uint)
+  )
+  (let 
+    (
+      (total_loans (get total_loans credit_record))
+      (on_time_payments (get on_time_payments credit_record))
+      (late_payments (get late_payments credit_record))
+      (rolling_balance (calculate-rolling-balance applicant))
+    )
+    (if (is-eq total_loans u0)
+      (begin
+        (asserts! (is-eq (+ late_payments on_time_payments) total_loans) false)
+        (asserts! (>= rolling_balance requested_amount) false)
+        (asserts! (>= (determine-credit-limit (+ (calculate-activity_score rolling_balance) (calculate-payment_score total_loans on_time_payments late_payments))) requested_amount) false)
+        (map-set credit_history applicant { 
+            total_loans: total_loans,
+            on_time_payments: on_time_payments,
+            late_payments: late_payments,
+          }
+        )
+        true
+      )
+      (begin 
+        (asserts! (is-eq (+ late_payments on_time_payments) total_loans) false)
+        (asserts! (>= rolling_balance requested_amount) false)
+        (asserts! (>= (determine-credit-limit (+ (calculate-payment_score total_loans on_time_payments late_payments) (calculate-activity_score rolling_balance))) requested_amount) false)
+        (map-set credit_history applicant {
+            total_loans: total_loans,
+            on_time_payments: on_time_payments,
+            late_payments: late_payments,
+          }
+        )
+        true
+      )
+    )
+  ) 
+)
+
+;; LENDER FUNCTIONS
+
+;; Deposit liquidity into the pool
+(define-public (deposit-liquidity (amount uint))
+  (let
+    (
+      (current_balance (default-to u0 (get balance (map-get? lender_positions tx-sender))))
+    ) 
+    (asserts! (>= amount u10000000) ERR_INSUFFICIENT_AMOUNT)
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token transfer amount tx-sender (as-contract tx-sender) none))
+    (map-set lender_positions tx-sender 
+      {
+        balance: (+ current_balance amount), 
+        locked_block: stacks-block-height, 
+        unlock_block: (+ stacks-block-height (days-to-blocks (var-get lender_lock_period)))
+      }
+    )
+    (var-set total_liquidity_pool (+ (var-get total_liquidity_pool) amount))
+    (print {
+      event: "liquidity_deposited",
+      lender: tx-sender,
+      amount: amount, 
+      locked_until_block: (+ stacks-block-height (days-to-blocks (var-get lender_lock_period))),
+      total_pool_size: (var-get total_liquidity_pool)
+    })
+    (ok true)
+  )
+)
+
+;; Withdraw liquidity from the pool
+(define-public (withdraw-liquidity (amount uint)) 
+  (begin
+    (let
+      (
+        (lender_balance (default-to u0 (get balance (map-get? lender_positions tx-sender))))
+        (unlock_block (default-to u0 (get unlock_block (map-get? lender_positions tx-sender))))
+        (locked_block (default-to u0 (get locked_block (map-get? lender_positions tx-sender))))
+        (contract_balance (unwrap-panic (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token get-balance (as-contract tx-sender))))
+        (proportional_share 
+          (if (> lender_balance u0)
+            (/ 
+              (* lender_balance contract_balance) 
+              (if (> (var-get total_liquidity_pool) u0)
+                (var-get total_liquidity_pool)
+                u1
+              )
+            )
+            u0
+          )
+        )
+      )
+      (asserts! (> lender_balance u0) ERR_INVALID_LENDER)
+      (asserts! (<= amount proportional_share) ERR_POOL_LIMIT_EXCEEDED)
+      (asserts! (<= unlock_block stacks-block-height) ERR_FUNDS_LOCKED)
+      (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token transfer amount (as-contract tx-sender) tx-sender none))
+      (var-set total_liquidity_pool 
+        (if (< lender_balance amount)
+          (+ 
+            (- (var-get total_liquidity_pool) lender_balance)
+            (- proportional_share amount)
+          )
+          (- (var-get total_liquidity_pool) amount)
+        )
+      )
+      (if (>= amount lender_balance)
+        (if (is-eq amount proportional_share)
+          (map-delete lender_positions tx-sender)
+          (map-set lender_positions tx-sender 
+            {
+              balance: (- proportional_share amount),
+              locked_block: locked_block,
+              unlock_block: unlock_block
+            }
+          )
+        )
+        (if (< lender_balance proportional_share)
+          (map-set lender_positions tx-sender 
+            {
+              balance: (- proportional_share amount),
+              locked_block: locked_block,
+              unlock_block: unlock_block
+            }
+          )
+          (map-set lender_positions tx-sender 
+            {
+              balance: (- lender_balance amount),
+              locked_block: locked_block,
+              unlock_block: unlock_block
+            }
+          )
+        )
+      )
+    )
+    (print {event: "liquidity_withdrawn", lender: tx-sender, amount: amount})
+    (ok true)
+  )
+)
